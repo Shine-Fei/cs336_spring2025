@@ -170,8 +170,6 @@ class RotaryPositionalEmbedding(nn.Module):
         x(in_query_or_key) (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
         token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
         '''
-        #in_dtype = x.dtype
-        #x = x.to(torch.float32)
         x_pair = rearrange(x, '... sequence_length (d_pair two) -> ... sequence_length d_pair two', two = 2)
         cos = self.cos_cache[token_positions] #[batch_size, max_seq_len, d_k // 2]
         sin = self.sin_cache[token_positions]
@@ -181,9 +179,10 @@ class RotaryPositionalEmbedding(nn.Module):
             ),
             dim=-2
         )
-        x_rot = einsum(rot_m, x_pair, '... d_pair i j , ... d_pair j-> ... d_pair i')
+        #print("rot_m.shape:", rot_m.shape) # (batch_size, seq_len, d_pair, 2, 2)
+        #print("x_pair.shape:", x_pair.shape) # (batch_size, head, seq_len, d_pair, 2]
+        x_rot = einsum(rot_m, x_pair, 'batch seq_l d_pair i j , batch  head seq_l d_pair j-> batch head seq_l d_pair i')
         out = rearrange(x_rot, '... d_pair i -> ... (d_pair i)', i = 2)
-        #return out.to(in_dtype)
         return out
     
 class my_multihead_self_attention(nn.Module):

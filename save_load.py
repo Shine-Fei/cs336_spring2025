@@ -16,8 +16,8 @@ def dataloader(x, batch_size, context_length, device):
 
     idx = np.random.randint(0, len(x) - context_length, size=batch_size)
     x_batch = np.stack([x[i: i + context_length + 1] for i in idx])
-    input_ = torch.from_numpy(x_batch[:, :-1]).to(device)
-    target = torch.from_numpy(x_batch[:, 1:]).to(device)
+    input_ = torch.from_numpy(x_batch[:, :-1]).long().to(device)
+    target = torch.from_numpy(x_batch[:, 1:]).long().to(device)
     return input_, target
 
 def save_checkpoint(model, optimizer, iteration, out):

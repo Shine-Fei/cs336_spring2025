@@ -2,6 +2,8 @@ from typing import Iterable, Iterator
 import json
 import regex as re
 import multiprocessing
+import base64
+from tqdm import tqdm
 from utils.chunking import find_chunk_boundaries
 
 class bpe_tokenizer():
@@ -29,12 +31,18 @@ class bpe_tokenizer():
         vocab_filepath: str
         merges_filepath: str
         special_tokens: list[str] | None = None
-        因为不知道输入对应的文件类型和格式，需要进一步适配各种格式
         '''
-        with open(vocab_filepath, "rb") as f:
-            vocab = json.load(f)
-        with open(merges_filepath, "rb") as f:
-            merges = json.load(f)
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            vocab_b64 = json.load(f)
+        vocab = {int(k): base64.b64decode(v) for k, v in vocab_b64.items()}
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            merges = [
+                (
+                    base64.b64decode(a_str),
+                    base64.b64decode(b_str)
+                )
+                for a_str, b_str in (line.strip().split() for line in f)
+            ]
         return cls(vocab, merges, special_tokens)  # 用 cls 创建类的实例
 
     def encode(self, text: str) -> list[int]:
@@ -74,8 +82,8 @@ class bpe_tokenizer():
         token_id = [self.vocab_inv[i] for i in token_list]
         return token_id
     
-    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        for line in iterable:
+    def encode_iterable(self, iterable: Iterable[str], total=None) -> Iterator[int]:
+        for line in tqdm(iterable, total=total):
             if not line:
                 continue
             for token_id in self.encode(line):
