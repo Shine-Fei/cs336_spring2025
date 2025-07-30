@@ -4,10 +4,31 @@ import regex as re
 import multiprocessing
 import base64
 from tqdm import tqdm
+import heapq
 from utils.chunking import find_chunk_boundaries
+from tqdm.contrib.concurrent import process_map
+
+class Node:
+    """双向链表中的节点"""
+    _id_counter = 0 
+    def __init__(self, value):
+        self.value = value  # 当前 token 的字节内容
+        self.prev = None    # 指向前一个节点
+        self.next = None    # 指向后一个节点
+        self.active = True  # 节点是否有效（用于懒惰删除）
+        # 为每个新创建的节点分配一个唯一的、递增的ID
+        self.id = Node._id_counter
+        Node._id_counter += 1
+
+    def __lt__(self, other):
+        """
+        定义 Node 对象之间的小于 (<) 比较规则。
+        我们根据节点的唯一 ID 来比较。
+        """
+        return self.id < other.id
 
 class bpe_tokenizer():
-    def __init__(self, vocab, merges, special_tokens=None):
+    def __init__(self, vocab, merges, special_tokens=None, num_processes = 10):
         '''
         vocab: dict[int, bytes]
         merges: list[tuple[bytes, bytes]]
@@ -21,12 +42,12 @@ class bpe_tokenizer():
             self.special_tokens = sorted(special_tokens, key=len, reverse=True)
         else:
             self.special_tokens = special_tokens
-        self.num_processes = 16
+        self.num_processes = num_processes
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.merge_ranks = {pair: i for i, pair in enumerate(merges)}
 
     @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None, num_processes = 10):
         '''
         vocab_filepath: str
         merges_filepath: str
@@ -43,8 +64,9 @@ class bpe_tokenizer():
                 )
                 for a_str, b_str in (line.strip().split() for line in f)
             ]
-        return cls(vocab, merges, special_tokens)  # 用 cls 创建类的实例
-
+        return cls(vocab, merges, special_tokens, num_processes)  # 用 cls 创建类的实例
+    
+    #原版
     def encode(self, text: str) -> list[int]:
         if not text:
             return []
@@ -55,7 +77,7 @@ class bpe_tokenizer():
             #2. Apply the merges
             for tokens in pretok_lst:
                 token_list.extend(self.merge_token(tokens))
-
+    
         elif len(text) < 1000:
             #split_pattern = "(" + "|".join(re.escape(token) for token in self.special_tokens) + ")"
             split_pattern = "|".join(re.escape(token) for token in self.special_tokens)
@@ -81,14 +103,15 @@ class bpe_tokenizer():
         #将token_list转化为int list
         token_id = [self.vocab_inv[i] for i in token_list]
         return token_id
-    
+
+
     def encode_iterable(self, iterable: Iterable[str], total=None) -> Iterator[int]:
         for line in tqdm(iterable, total=total):
             if not line:
                 continue
             for token_id in self.encode(line):
                 yield token_id
-    
+
     def decode(self, ids: list[int]) -> str:
         mer_bytes = b"".join(self.vocab[i] for i in ids)
         decoded_text = mer_bytes.decode("utf-8", errors="replace")
@@ -116,34 +139,105 @@ class bpe_tokenizer():
                     # 应用 BPE 合并
                     merged = self.merge_token(token_bytes)  # 返回 List[bytes]
                     token_list.extend(merged)
+                
         return token_list
     
-    #错误的合并方法，先出现的不一定是合并优先级最高的
-    #def merge_token(self, tokens: list[bytes]) -> list[bytes]:
-    #    #合并
+    #def merge_token(self, tokens: list[bytes]) -> list[bytes]:    
+    ##simple implementation
     #    while True:
-    #        for i in range(len(tokens) - 1):
-    #            pair = (tokens[i], tokens[i + 1])
-    #            if pair in self.merges:
-    #                tokens[i:i+2] = [pair[0] + pair[1]]
-    #                break
-    #        else:
+    #        # 找出所有可合并的 pair 和位置
+    #        pairs = [(i, (tokens[i], tokens[i+1]))
+    #                for i in range(len(tokens)-1)
+    #                if (tokens[i], tokens[i+1]) in self.merge_ranks]
+    #        if not pairs:
     #            break
+    #        # 贪心选出 rank 最小的 pair
+    #        i, pair = min(pairs, key=lambda x: self.merge_ranks[x[1]])
+    #        tokens[i:i+2] = [pair[0] + pair[1]]
     #    return tokens
     
     def merge_token(self, tokens: list[bytes]) -> list[bytes]:
-        
-        while True:
-            # 找出所有可合并的 pair 和位置
-            pairs = [(i, (tokens[i], tokens[i+1]))
-                    for i in range(len(tokens)-1)
-                    if (tokens[i], tokens[i+1]) in self.merge_ranks]
-            if not pairs:
-                break
-            # 贪心选出 rank 最小的 pair
-            i, pair = min(pairs, key=lambda x: self.merge_ranks[x[1]])
-            tokens[i:i+2] = [pair[0] + pair[1]]
-        return tokens
+        if len(tokens) < 2:
+            return tokens
+
+        # === 步骤 1: 初始化 - 构建双向链表 ===
+        head = Node(tokens[0])
+        prev_node = head
+        for i in range(1, len(tokens)):
+            current_node = Node(tokens[i])
+            prev_node.next = current_node
+            current_node.prev = prev_node
+            prev_node = current_node
+
+        # === 步骤 2: 初始化 - 填充优先队列 (Heap) ===
+        heap = []
+        current_node = head
+        while current_node and current_node.next:
+            pair = (current_node.value, current_node.next.value)
+            if pair in self.merge_ranks:
+                rank = self.merge_ranks[pair]
+                # 堆中存储: (优先级, 左节点, 右节点)
+                heapq.heappush(heap, (rank, current_node, current_node.next))
+            current_node = current_node.next
+
+        # === 步骤 3: 主循环 - 合并最高优先级的词对 ===
+        while heap:
+            # 取出当前优先级最高的词对
+            rank, node1, node2 = heapq.heappop(heap)
+
+            # 关键的有效性检查（懒惰删除）
+            # 如果 node1 或 node2 因为之前的合并已经失效，则跳过
+            if not node1.active or not node2.active or node1.next != node2:
+                continue
+
+            # --- 执行合并 ---
+            # 1. 标记旧节点为失效
+            node1.active = False
+            node2.active = False
+
+            # 2. 创建合并后的新节点
+            new_value = node1.value + node2.value
+            new_node = Node(new_value)
+
+            # 3. 重新连接链表
+            #    A <-> node1 <-> node2 <-> D  ==>  A <-> new_node <-> D
+            left_neighbor = node1.prev
+            right_neighbor = node2.next
+
+            new_node.prev = left_neighbor
+            if left_neighbor:
+                left_neighbor.next = new_node
+            else:
+                head = new_node # 如果合并的是头节点，则更新头节点
+
+            new_node.next = right_neighbor
+            if right_neighbor:
+                right_neighbor.prev = new_node
+
+            # 4. 将新产生的邻居对加入堆中
+            # a) 检查左侧新邻居对 (A, new_node)
+            if left_neighbor:
+                pair = (left_neighbor.value, new_node.value)
+                if pair in self.merge_ranks:
+                    new_rank = self.merge_ranks[pair]
+                    heapq.heappush(heap, (new_rank, left_neighbor, new_node))
+            
+            # b) 检查右侧新邻居对 (new_node, D)
+            if right_neighbor:
+                pair = (new_node.value, right_neighbor.value)
+                if pair in self.merge_ranks:
+                    new_rank = self.merge_ranks[pair]
+                    heapq.heappush(heap, (new_rank, new_node, right_neighbor))
+
+        # === 步骤 4: 收尾 - 从链表中提取结果 ===
+        final_tokens = []
+        current_node = head
+        while current_node:
+            final_tokens.append(current_node.value)
+            current_node = current_node.next
+            
+        return final_tokens
+
     
     def split_with_special_tokens(self, text: str, split_pattern) -> list[str]:
         

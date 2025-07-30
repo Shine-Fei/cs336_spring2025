@@ -286,6 +286,7 @@ class transformer_lm(nn.Module):
         self.layers = nn.ModuleList([transformer_block(d_model, num_heads, d_ff, theta, d_k, context_length, **self.kwargs) for _ in range(num_layers)])
         self.ln_final = my_RMSNorm(d_model, **self.kwargs)
         self.lm_head = my_linear(d_model, vocab_size, **self.kwargs)
+        self.context_length = context_length
     
     def load_state_dict(self, state_dict, strict: bool = True):
         """
@@ -321,6 +322,29 @@ class transformer_lm(nn.Module):
         x = self.ln_final(x)
         x = self.lm_head(x)
         return x
+    
+    @torch.no_grad()
+    def decoding(self, prompt, max_token, temperature, top_p_value, end_id = None):
+        self.eval()
+        input_len = prompt.size(-1)
+        for _ in range(max_token):
+            logits = self.forward(prompt[:, -self.context_length:]) #(sequence_length × vocab size)
+            next_logits = logits[:,-1]
+            next_logits = next_logits / temperature
+            t_scaling = my_softmax(next_logits, dim=-1)
+            probs, indice = torch.sort(t_scaling, descending=True)
+            cum_probs = torch.cumsum(probs, dim=-1)
+            top_p_mask = cum_probs <= top_p_value
+            top_p_mask[:,0] = True
+            t_scaling_mask = torch.zeros_like(t_scaling, dtype=torch.bool)
+            t_scaling_mask.scatter_(dim=-1, index=indice, src=top_p_mask)
+            new_logits = t_scaling.masked_fill(~t_scaling_mask, float('-inf'))
+            new_logits = my_softmax(new_logits, dim=-1)
+            next_token = torch.multinomial(new_logits, num_samples=1)
+            if next_token.item() == end_id:
+                break
+            prompt = torch.cat((prompt, next_token),dim=-1)
+        return prompt[:,input_len:]
     
 class adamw(torch.optim.Optimizer):
     def __init__(self, params, lr = 1e-3, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8):
