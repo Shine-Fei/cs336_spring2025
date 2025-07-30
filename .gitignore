@@ -1,6 +1,8 @@
 #result
 result/
 
+wandb/
+
 #test
 test.ipynb
 

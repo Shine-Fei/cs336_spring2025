@@ -1,5 +1,0 @@
-[default]
-entity = flash0123-georgia-institute-of-technology
-project = cs336
-base_url = https://api.wandb.ai
-
