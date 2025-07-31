@@ -7,7 +7,7 @@ import math
 from collections.abc import Callable, Iterable
 from typing import Optional
 
-#DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -16,7 +16,6 @@ else:
     DEVICE = torch.device("cpu")
 
 def my_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
-    #in_features = in_features - in_features.max(dim=dim, keepdim=True).values
     in_features = in_features - torch.max(in_features, dim=dim, keepdim=True).values
     exp_x = torch.exp(in_features)
     return exp_x / torch.sum(exp_x, dim=dim, keepdim=True)
@@ -62,7 +61,6 @@ def update_lr(optimizer, new_lr):
 
 def gradient_clipping(params, max_norm, eps = 1e-6):
     grads = [p.grad.detach() for p in params if p.grad is not None]
-    #l2_nrom = torch.norm(torch.cat([g.view(-1) for g in grads]), p=2)
     l2_nrom = torch.norm(torch.stack([torch.norm(g, p=2) for g in grads]), p=2)
     if l2_nrom >= max_norm:
         scale = max_norm / (l2_nrom + eps)
@@ -144,6 +142,23 @@ class my_swiglu(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(self.SiLU(self.w1(x)) * self.w3(x))
     
+class my_silu(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        '''
+        d_model (int): Dimensionality of the feedforward input and output.
+        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
+        '''
+        super().__init__()
+        self.kwargs = {'device':device, 'dtype':dtype}
+        self.w1 = my_linear(d_model, d_ff, **self.kwargs)
+        self.w2 = my_linear(d_ff, d_model, **self.kwargs)
+
+    def SiLU(self, x):
+        return x * torch.sigmoid(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.SiLU(self.w1(x)))
+    
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
         '''
@@ -154,10 +169,8 @@ class RotaryPositionalEmbedding(nn.Module):
         '''
         super().__init__()
         half_l = d_k // 2
-        #k = torch.arange(half_l, dtype=torch.float32, device=device)
         k = torch.arange(half_l, device=device)
         inv_k = 1 / (theta ** (k / half_l))
-        #i = torch.arange(max_seq_len, dtype=torch.float32,device=device)
         i = torch.arange(max_seq_len, device=device)
         theta_ik = einsum(i, inv_k, 'max_seq_len, half_l -> max_seq_len half_l')
         cos = torch.cos(theta_ik)
@@ -179,8 +192,6 @@ class RotaryPositionalEmbedding(nn.Module):
             ),
             dim=-2
         )
-        #print("rot_m.shape:", rot_m.shape) # (batch_size, seq_len, d_pair, 2, 2)
-        #print("x_pair.shape:", x_pair.shape) # (batch_size, head, seq_len, d_pair, 2]
         x_rot = einsum(rot_m, x_pair, 'batch seq_l d_pair i j , batch  head seq_l d_pair j-> batch head seq_l d_pair i')
         out = rearrange(x_rot, '... d_pair i -> ... (d_pair i)', i = 2)
         return out
@@ -192,7 +203,7 @@ class my_multihead_self_attention(nn.Module):
         self.rope = rope
         self.h = num_heads
         self.d_model = d_model
-        self.qkv = my_linear(d_model, 3 * d_model, **self.kwargs) #堆叠h*dk，h*dk，h*dv
+        self.qkv = my_linear(d_model, 3 * d_model, **self.kwargs) #stack: h*dk，h*dk，h*dv
         self.output_proj = my_linear(d_model, d_model, **self.kwargs)
 
     def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
@@ -216,7 +227,7 @@ class multihead_self_attention_rope(nn.Module):
         self.rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len, **self.kwargs)
         self.h = num_heads
         self.d_model = d_model
-        self.qkv = my_linear(d_model, 3 * d_model, **self.kwargs) #堆叠h*dk，h*dk，h*dv
+        self.qkv = my_linear(d_model, 3 * d_model, **self.kwargs)
         self.output_proj = my_linear(d_model, d_model, **self.kwargs)
 
     def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
@@ -246,8 +257,8 @@ class transformer_block(nn.Module):
 
     def load_state_dict(self, state_dict, strict: bool = True):
         """
-        自动拼接 q_proj + k_proj + v_proj -> self.qkv.weight
-        并将 output_proj 的权重正常加载
+        combine q_proj + k_proj + v_proj -> self.qkv.weight
+        so that the weights of output_proj can be properly loaded
         """
         q_key = next(k for k in state_dict if k.endswith('q_proj.weight'))
         prefix = q_key.rsplit('q_proj.weight', 1)[0]  # e.g., 'layers.0.attn.'
@@ -256,7 +267,7 @@ class transformer_block(nn.Module):
         k = state_dict.pop(prefix + 'k_proj.weight')
         v = state_dict.pop(prefix + 'v_proj.weight')
 
-        # 拼接为 qkv
+        # combine qkv
         qkv_weight = torch.cat([q, k, v], dim=0)
         state_dict[prefix + 'qkv.weight'] = qkv_weight
         return super().load_state_dict(state_dict, strict)
@@ -266,10 +277,7 @@ class transformer_block(nn.Module):
         x: (Float[Tensor, "batch sequence_length d_model"]):
         '''
         if token_positions is None:
-        #先构造token_positions
             batch, seq_len , _= x.shape
-            #token_positions = torch.arange(seq_len, **self.kwargs)
-            #token_positions = token_positions.unsqueeze(0).expand(batch, seq_len)
             token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch, 1)
         
         x = x + self.attn(self.ln1(x), token_positions)
@@ -290,10 +298,10 @@ class transformer_lm(nn.Module):
     
     def load_state_dict(self, state_dict, strict: bool = True):
         """
-        自动拼接 q_proj + k_proj + v_proj -> self.qkv.weight
-        并将 output_proj 的权重正常加载
+        combine q_proj + k_proj + v_proj -> self.qkv.weight
+        so that the weights of output_proj can be properly loaded
         """
-        state_dict = state_dict.copy()  # 避免就地 pop
+        state_dict = state_dict.copy()
         for l in range(len(self.layers)):
             prefix = f'layers.{l}.attn.'
             q_key = prefix + 'q_proj.weight'
@@ -312,10 +320,7 @@ class transformer_lm(nn.Module):
     def forward(self, input_indices: Int[Tensor, "batch seq_len"], token_positions: Int[Tensor, "batch seq_len"] | None = None):
         x = self.token_embeddings(input_indices)
         if token_positions is None:
-        #先构造token_positions
             batch, seq_len , _= x.shape
-            #token_positions = torch.arange(seq_len, **self.kwargs)
-            #token_positions = token_positions.unsqueeze(0).expand(batch, seq_len)
             token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch, 1)
         for layer in self.layers:
             x = layer(x, token_positions)
@@ -345,6 +350,93 @@ class transformer_lm(nn.Module):
                 break
             prompt = torch.cat((prompt, next_token),dim=-1)
         return prompt[:,input_len:]
+    
+class transformer_block_noRMSNorm(transformer_block):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(d_model, num_heads, d_ff, theta, d_k, max_seq_len, **self.kwargs)
+
+    def forward(self, x, token_positions: Int[Tensor, "batch seq_len"] | None = None):
+        '''
+        x: (Float[Tensor, "batch sequence_length d_model"]):
+        '''
+        if token_positions is None:
+            batch, seq_len , _= x.shape
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch, 1)
+        x = x + self.attn(x, token_positions)
+        x = x + self.ffn(x)
+        return x
+    
+class transformer_noRMSNorm(transformer_lm):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, theta: float, d_k: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, theta, d_k, **self.kwargs)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model == d_k * num_heads, "d_model must equal d_k * num_heads"
+        self.layers = nn.ModuleList([transformer_block_noRMSNorm(d_model, num_heads, d_ff, theta, d_k, context_length, **self.kwargs) for _ in range(num_layers)])
+    
+    def forward(self, input_indices: Int[Tensor, "batch seq_len"], token_positions: Int[Tensor, "batch seq_len"] | None = None):
+        x = self.token_embeddings(input_indices)
+        if token_positions is None:
+            batch, seq_len , _= x.shape
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch, 1)
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        x = self.lm_head(x)
+        return x
+
+
+class transformer_block_postnorm(transformer_block):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(d_model, num_heads, d_ff, theta, d_k, max_seq_len, **self.kwargs)
+
+    def forward(self, x, token_positions: Int[Tensor, "batch seq_len"] | None = None):
+        '''
+        x: (Float[Tensor, "batch sequence_length d_model"]):
+        '''
+        if token_positions is None:
+            batch, seq_len , _= x.shape
+            token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch, 1)
+        x = self.ln1(x + self.attn(x, token_positions))
+        x = self.ln2(x + self.ffn(x))
+        return x
+
+class transformer_postnorm(transformer_lm):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, theta: float, d_k: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, theta, d_k, **self.kwargs)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model == d_k * num_heads, "d_model must equal d_k * num_heads"
+        self.layers = nn.ModuleList([transformer_block_postnorm(d_model, num_heads, d_ff, theta, d_k, context_length, **self.kwargs) for _ in range(num_layers)])    
+
+class transformer_block_nope(transformer_block):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(d_model, num_heads, d_ff, theta, d_k, max_seq_len, **self.kwargs)
+        self.attn = my_multihead_self_attention(d_model, num_heads, **self.kwargs)
+
+class transformer_nope(transformer_lm):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, theta: float, d_k: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, theta, d_k, **self.kwargs)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model == d_k * num_heads, "d_model must equal d_k * num_heads"
+        self.layers = nn.ModuleList([transformer_block_nope(d_model, num_heads, d_ff, theta, d_k, context_length, **self.kwargs) for _ in range(num_layers)])
+
+class transformer_block_silu(transformer_block):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(d_model, num_heads, d_ff, theta, d_k, max_seq_len, **self.kwargs)
+        self.ffn = my_silu(d_model, d_ff, **self.kwargs)
+
+class transformer_silu(transformer_lm):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, theta: float, d_k: int, device=None, dtype=None):
+        self.kwargs = {'device':device, 'dtype':dtype}
+        super().__init__(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, theta, d_k, **self.kwargs)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model == d_k * num_heads, "d_model must equal d_k * num_heads"
+        self.layers = nn.ModuleList([transformer_block_silu(d_model, num_heads, d_ff, theta, d_k, context_length, **self.kwargs) for _ in range(num_layers)])
     
 class adamw(torch.optim.Optimizer):
     def __init__(self, params, lr = 1e-3, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8):

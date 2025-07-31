@@ -5,9 +5,10 @@ import json
 import base64
 import logging
 import wandb
+from tqdm import tqdm
 import os
 from save_load import *
-from my_module import adamw, transformer_lm, cross_entropy, lr_cosine_schedule, update_lr, gradient_clipping
+from my_module import adamw, transformer_noRMSNorm, transformer_postnorm, transformer_nope, transformer_silu, cross_entropy, lr_cosine_schedule, update_lr, gradient_clipping
 from train_tokenizer import run_train_bpe
 from my_tokenizer import bpe_tokenizer
 
@@ -36,8 +37,6 @@ def main():
     parser.add_argument('--train_cache_path', type=str, default='result/tokenizer/train_data.bin')
     parser.add_argument('--valid_data_path',type=str,required=True)
     parser.add_argument('--valid_cache_path', type=str, default='result/tokenizer/valid_data.bin')
-    parser.add_argument('--save_path',type=str,default='result/state.pt')
-    parser.add_argument('--best_path',type=str,default='result/state_best.pt')
     parser.add_argument('--vocab_path', type=str, default='result/tokenizer/bpe_vocab.json')
     parser.add_argument('--merges_path', type=str, default='result/tokenizer/bpe_merges.txt')
     parser.add_argument('--wandb_project', type=str, default=None)
@@ -47,9 +46,23 @@ def main():
     parser.add_argument('--encode_mode',type=str,default='iter')
     parser.add_argument('--num_processes',type=int,default=10)
     parser.add_argument('--max_norm',type=float,default=1.0)
-    
+
+    parser.add_argument(
+        '--ablation',
+        type=str.lower,
+        required=True,
+        choices=['rmsnorm', 'post_norm', 'nope', 'silu'],
+        help='Ablation type: choose from [rmsnorm, post_norm, nope, silu]'
+    )
+    parser.add_argument('--save_path',type=str)
+    parser.add_argument('--best_path',type=str)
 
     args = parser.parse_args()
+
+    if args.save_path is None:
+        args.save_path = f'result/ablation/{args.ablation}/state.pt'
+    if args.best_path is None:
+        args.best_path = f'result/ablation/{args.ablation}/state_best.pt'
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -121,7 +134,18 @@ def main():
     valid_data = np.memmap(args.valid_cache_path, mode='r', dtype=np.uint16)
 
     d_k = args.d_model // args.num_heads
-    model = transformer_lm(args.vocab_size, args.context_length, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta, d_k, device=device)
+    if args.ablation == 'rmsnorm':
+        model = transformer_noRMSNorm(args.vocab_size, args.context_length, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta, d_k, device=device)
+    elif args.ablation == 'post_norm':
+        model = transformer_postnorm(args.vocab_size, args.context_length, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta, d_k, device=device)
+    elif args.ablation == 'nope':
+        model = transformer_nope(args.vocab_size, args.context_length, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta, d_k, device=device)
+    
+    elif args.ablation == 'silu':
+        model = transformer_silu(args.vocab_size, args.context_length, args.d_model, args.num_layers, args.num_heads, args.d_ff, args.rope_theta, d_k, device=device)
+    else:
+        raise('invalid ablation parameters')
+
     optimizer = adamw(model.parameters(), lr=args.lr, weight_decay = args.weight_decay, betas=args.betas, eps=args.eps)
 
     if args.train_mode == 'continue':
@@ -137,7 +161,7 @@ def main():
     #dataloader_valid = val_dataloader(valid_data, args.batch_size, args.context_length, device) #too slow for validating all data
     step_count = args.total_tokens // (args.batch_size * args.context_length)
     min_loss = float('inf')
-    logging.info("Begin training...")
+    logging.info(f"Begin training, ablation for {args.ablation}")
     for epoch in range(args.epochs):
         #for _ in range(step_count):
         for x, y in dataloader_train:

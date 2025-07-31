@@ -1,7 +1,7 @@
 # CS336 Spring 2025 Assignment 1: Basics
 
 ###
-Implementation for CS336 Spring 2025 Assignment 1 (not finished yet)
+My implementation for CS336 Spring 2025 Assignment 1
 
 
 ### Acknowledgements
